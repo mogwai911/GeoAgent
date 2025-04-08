@@ -1,5 +1,8 @@
 # GIS Code Generation Agent Pipeline Overview
 
+##Aim
+This project focuses on experimenting with different adaptive approaches to enhance LLM's semantic understanding and task performance and evaluating LLM's understanding of natural language queries and code generation capabilities through the task of geographic data extraction. The project's contribution is to find feasible approaches to enhance LLM's comprehension of the structure and semantics of geo-data and simultaneously render LLM's code generation relatively stable and efficient. The current version is under experiment and will be reformulated into a more autonomous agent.
+
 This document outlines the architecture and operational flow of the GIS Code Generation Agent, which is built as a modular, self-correcting agent system capable of interpreting user queries, generating PyQGIS code, executing it, and automatically debugging failures.
 
 ## 🧠 Core Objective
