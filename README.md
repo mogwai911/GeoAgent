@@ -75,7 +75,7 @@ Coordinates the workflow:
 
 ### ⚙️ Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - Conda environment (with `PyQGIS`, `faiss`, `langchain`, etc.)
 - Local FAISS index and `geo_metadata.json` available under `/Project_K/`
 - Running VLLM server for `Qwen72B` model (`qwen_ip.txt` must exist)
