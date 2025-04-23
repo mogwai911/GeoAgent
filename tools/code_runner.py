@@ -4,138 +4,133 @@ import json
 import tempfile
 import subprocess
 import traceback
-from typing import List
+from typing import List, Annotated
 from pydantic import BaseModel, Field
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-from agent.prompts.prompt_templates import CODE_GENERATION_PROMPT
-from agent.tools.llm_client import QwenChat
+from langchain_core.tools import tool, InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langchain_openai import ChatOpenAI
+from config.model_config import get_model_config
+from prompts.tool_prompt_templates import CODE_GENERATION_PROMPT
 from langchain_core.messages.ai import AIMessage
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# === LLM config ===
+model_config = get_model_config()
+model = ChatOpenAI(
+    base_url=model_config['base_url'],
+    api_key=model_config['api_key'],
+    model_name=model_config['model_name'],
+    streaming=True)
 
 class CodeRunnerInput(BaseModel):
     question: str = Field(..., description="User's task description")
     context: str = Field(..., description="RAG retrieved technical documentation context")
     filepaths: List[str] = Field(..., description="List of input data file paths")
-    output_path: str = Field(..., description="Directory to save output results")
-    history: List[dict] = Field(default_factory=list, description="History of previous failed code attempts")
+    debug_advice: str | None = Field(None, description="Optional debug suggestions for improving the generated code")
 
 class CodeRunnerOutput(BaseModel):
     code: str
     output_file: str
+    tool_used_file: str
     success: bool
-    error: str = ""
     stdout: str = ""
     stderr: str = ""
-    history: List[dict] = Field(default_factory=list)
 
-def code_generate_and_debug(input: CodeRunnerInput) -> CodeRunnerOutput:
-    print("\U0001f9e0 [code_runner] Entering code_generate_and_debug...")
-    question = input.question
-    context = input.context
-    filepaths = input.filepaths
-    output_dir = input.output_path
-    history = input.history or []
-    error = None
+@tool(
+    "code_generate_tool",
+    args_schema=CodeRunnerInput,
+    return_direct=False,
+    description="Generate and execute PyQGIS code based on the user task, semantic context, and provided input files. The tool attempts to run the code, capture standard output and error, and determine whether the execution was successful. Optionally accepts debug advice to refine the generation logic."
+)
+def code_generate(
+    question: str,
+    context: str,
+    filepaths: List[str],
+    debug_advice: str | None = None,
+    # state: Annotated[dict, InjectedState],
+    # call_id: Annotated[str, InjectedToolCallId]
+    ) -> CodeRunnerOutput:
+    #print(f"[code_runner] Entering code_generate... Call ID: {call_id}")
     generated_code = ""
     stdout = ""
     stderr = ""
+    
+    prompt = CODE_GENERATION_PROMPT.render(
+        question=question,
+        filepath=filepaths,
+        context=context,
+        output_path=r"/home/kaiyuan/lu2025-17-15/Kaiyuan/sp_group/result",
+        debug_advice=debug_advice or ""
+    )
 
-    for attempt in range(5):
-        prompt = CODE_GENERATION_PROMPT.render(
-            question=question,
-            filepath="\n".join(filepaths),
-            context=context,
-            error=error,
-            history=history,
-            output_path=output_dir
+    raw_output = model.invoke(prompt)
+
+    if isinstance(raw_output, AIMessage):
+        raw_output = raw_output.content or ""
+    elif not isinstance(raw_output, str):
+        raw_output = str(raw_output or "")
+
+    match = re.search(r"```python\s*(.*?)```", raw_output, re.DOTALL)
+    generated_code = match.group(1).strip() if match else raw_output.strip()
+    match_input = re.search(r"##INPUT##\s*(\{.*\})", generated_code)
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".py", mode="w") as temp_file:
+            temp_file.write(generated_code)
+            script_path = temp_file.name
+
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["PYTHONUNBUFFERED"] = "1"
+
+        result = subprocess.run(
+            ["python", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            env=env,
+            text=True
         )
 
-        llm = QwenChat()
-        raw_output = llm.invoke(prompt)
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
 
-        if isinstance(raw_output, AIMessage):
-            raw_output = raw_output.content or ""
-        elif not isinstance(raw_output, str):
-            raw_output = str(raw_output or "")
-
-        match = re.search(r"```python\s*(.*?)```", raw_output, re.DOTALL)
-        generated_code = match.group(1).strip() if match else raw_output.strip()
-
+        match_structured = re.search(r"##RESULT##\s*(\{.*\})", stdout)
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".py", mode="w") as temp_file:
-                temp_file.write(generated_code)
-                script_path = temp_file.name
+            result_data = json.loads(match_structured.group(1)) if match_structured else {}
+            output_file = result_data.get("output_file", "")
+        except Exception:
+            output_file = ""
 
-            env = os.environ.copy()
-            env["QT_QPA_PLATFORM"] = "offscreen"
-            env["PYTHONUNBUFFERED"] = "1"
+        file_exists = os.path.exists(output_file)
+        file_size_ok = os.path.getsize(output_file) > 0 if file_exists else False
+        traceback_error = "traceback" in stderr.lower()
 
-            result = subprocess.run(
-                ["python", script_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=60,
-                env=env,
-                text=True
+        success = file_exists and file_size_ok and not traceback_error
+
+        if success:
+            return CodeRunnerOutput(
+                code=generated_code,
+                output_file=output_file,
+                tool_used_file=match_input,
+                success=True,
+                stdout=stdout,
+                stderr=stderr
             )
 
-            stdout = result.stdout.strip()
-            stderr = result.stderr.strip()
+    except Exception as e:
+        stderr += f"\n[Exception Caught]\n{traceback.format_exc()}"
 
-            match_structured = re.search(r"##RESULT##\s*(\{.*\})", stdout)
-            try:
-                result_data = json.loads(match_structured.group(1)) if match_structured else {}
-                output_file = result_data.get("output_file", "")
-            except Exception:
-                output_file = ""
-
-            file_exists = os.path.exists(output_file)
-            file_size_ok = os.path.getsize(output_file) > 0 if file_exists else False
-            traceback_error = "traceback" in stderr.lower()
-
-            success = file_exists and file_size_ok and not traceback_error
-
-            history.append({
-                "code": generated_code,
-                "error": "" if success else (stderr or "Generated code failed to save a valid output file."),
-                "stdout": stdout,
-                "stderr": stderr,
-                "output_file": output_file
-            })
-
-            if success:
-                return CodeRunnerOutput(
-                    code=generated_code,
-                    output_file=output_file,
-                    success=True,
-                    stdout=stdout,
-                    stderr=stderr,
-                    history=history
-                )
-
-            error = stderr or "Generated code failed to save a valid output file."
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            error_msg = f"{str(e)}\nTraceback:\n{tb}"
-            history.append({
-                "code": generated_code,
-                "error": error_msg,
-                "stdout": stdout,
-                "stderr": stderr or tb,
-                "output_file": ""
-            })
-            error = error_msg
-
-        finally:
-            if os.path.exists(script_path):
-                os.remove(script_path)
+    finally:
+        if os.path.exists(script_path):
+            os.remove(script_path)
 
     return CodeRunnerOutput(
         code=generated_code,
         output_file="",
+        tool_used_file=match_input,
         success=False,
-        error=error or "Execution failed",
         stdout=stdout,
-        stderr=stderr,
-        history=history
+        stderr=stderr
+
     )
